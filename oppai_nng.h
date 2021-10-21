@@ -470,8 +470,7 @@ namespace ocpp {
 
 				const auto p2 = (1.5f * p1) / _mm256_max_ps(bs.p_delta, MM256_SET1(AIM_TIMING_THRESHOLD));
 
-				result = 
-					_mm256_blendv_ps(MM256_SET1(0.f), p2, _mm256_cmp_ps(bs.angle, MM256_SET1(AIM_ANGLE_BONUS_BEGIN), _CMP_GT_OQ));
+				result = _mm256_and_ps(p2, _mm256_cmp_ps(bs.angle, MM256_SET1(AIM_ANGLE_BONUS_BEGIN), _CMP_GT_OQ));
 
 			}
 
@@ -518,16 +517,19 @@ namespace ocpp {
 
 	}
 	
-	void d_weigh_individual(std::vector<float>& __restrict vec, float& star, float& diff) {
-
-		std::sort(vec.begin(), vec.end(), std::greater<float>());// This is very slow
-
+	void d_weigh_individual(std::vector<float>& vec, float& star, float& diff) {
+		
+		if (vec.size() > u32(strain_weight_max_interation * 1.5f))
+			std::partial_sort(vec.begin(), vec.begin() + strain_weight_max_interation, vec.end(), std::greater<float>());
+		else
+			std::sort(vec.begin(), vec.end(), std::greater<float>());// This is very slow - within temp. 0.28ms on my machine
+		
 		float total{};
 		float difficulty{};
 		float weight{ 1.f };
 
-		const size_t size{ std::min(vec.size(), strain_weight_max_interation)};
 		const size_t real_size{ vec.size() };
+		const size_t size{ std::min(real_size, strain_weight_max_interation)};
 
 		size_t i{};
 
