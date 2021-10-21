@@ -1,7 +1,12 @@
 #pragma once
 
 // Requires c++20 and AVX2
-// Clang seems to generate better AVX over MSVC at a glance in the compiler explorer. Might want to check that out, -std=c++20 -mavx2 -mfma -O2
+
+// MSVC notes
+// Dont forget to compile with /arch:AVX2 - 25% speed increase
+// Might want to compile to x86. MSVC sometimes sucks at generating x64 AVX, also allows /Oy to be used
+
+// GCC would require at least: -std=c++20 -mavx2 -mfma -O2
 
 // Not particularly focused on stable parity. Could change in the future.
 
@@ -358,117 +363,89 @@ namespace ocpp {
 
 		{
 
-			const auto decay_delta = _mm256_mul_ps(_mm256_set1_ps(0.001f), bs.delta);
+			const auto decay_delta = 0.001f * bs.delta;
 
 			//ret.decay_speed = pow_8(_mm256_set1_ps(decay_base[DIFF_SPEED]), decay_delta);
 			//ret.decay_aim = pow_8(_mm256_set1_ps(decay_base[DIFF_AIM]), decay_delta);
 
-			ret.decay_speed = intel_exp_8(_mm256_mul_ps(_mm256_set1_ps(-1.20397282f), decay_delta));
-			ret.decay_aim = intel_exp_8(_mm256_mul_ps(_mm256_set1_ps(-1.89712000f), decay_delta));
+			ret.decay_speed = intel_exp_8(-1.20397282f * decay_delta);
+			ret.decay_aim = intel_exp_8(-1.89712000f * decay_delta);
 
 		}
 
-		const __m256 strain_time = _mm256_max_ps(bs.delta, _mm256_set1_ps(50.f));
+		const __m256 strain_time = _mm256_max_ps(bs.delta, MM256_SET1(50.f));
 
 		// Speed
 		{
 
-			const auto speed_distance = _mm256_min_ps(bs.distance, _mm256_set1_ps(SINGLE_SPACING));
-			const auto speed_delta = _mm256_max_ps(bs.delta, _mm256_set1_ps(MAX_SPEED_BONUS));
+			const auto speed_distance = _mm256_min_ps(bs.distance, MM256_SET1(SINGLE_SPACING));
+			const auto speed_delta = _mm256_max_ps(bs.delta, MM256_SET1(MAX_SPEED_BONUS));
 
 			__m256 speed_bonus = _mm256_set1_ps(0.f);
 
 			{
-				const auto min_speed_bonus = _mm256_set1_ps(MIN_SPEED_BONUS);
+
+				const auto min_speed_bonus = MM256_SET1(MIN_SPEED_BONUS);
 
 				const auto mask = _mm256_cmp_ps(speed_delta, min_speed_bonus, _CMP_LT_OQ);
 
-				if (_mm256_movemask_ps(mask)) {// Perf. win on slower map
-
-					constexpr auto exp{ 1.f / 40.f };
-
-					const auto base{ _mm256_sub_ps(min_speed_bonus, speed_delta) };
-
-					const auto add = pow2_8(_mm256_mul_ps(base, _mm256_set1_ps(exp)));
-
-					speed_bonus = _mm256_blendv_ps(_mm256_set1_ps(0.f), add, mask);
-
-				}
+				speed_bonus = _mm256_and_ps(pow2_8((1.f / 40.f) * (min_speed_bonus - speed_delta)), mask);
 
 			}
 
-			__m256 angle_bonus = _mm256_set1_ps(0.f);
+			__m256 angle_bonus = MM256_SET1(0.f);
 
 			#define AND(x,y) _mm256_and_ps((x),(y))
 
-			{
-				const auto min_speed_angle_bonus{ _mm256_set1_ps(SPEED_ANGLE_BONUS_BEGIN) };	
 
-				const auto mask0 = _mm256_cmp_ps(bs.angle, min_speed_angle_bonus, _CMP_LT_OQ);// Could add the original nan check here
-				auto mask1 = _mm256_cmp_ps(bs.angle, _mm256_set1_ps((float)M_PI * 0.5f), _CMP_LT_OQ);
-				auto mask2 = AND(
-						_mm256_cmp_ps(speed_distance, _mm256_set1_ps(ANGLE_BONUS_SCALE), _CMP_LT_OQ),
-						_mm256_cmp_ps(bs.angle, _mm256_set1_ps((float)M_PI * 0.25f), _CMP_LT_OQ)
-					);
-				auto mask3 = _mm256_cmp_ps(speed_distance, _mm256_set1_ps(ANGLE_BONUS_SCALE), _CMP_LT_OQ);
+			{
+
+				const auto mask0 = _mm256_cmp_ps(bs.angle, MM256_SET1(SPEED_ANGLE_BONUS_BEGIN), _CMP_LT_OQ);// Could add the original nan check here
+
+				auto mask1 = _mm256_cmp_ps(bs.angle, MM256_SET1((float)M_PI * 0.5f), _CMP_LT_OQ);
+
+				auto mask2 = _mm256_cmp_ps(speed_distance, MM256_SET1(ANGLE_BONUS_SCALE), _CMP_LT_OQ);
+
+				auto mask3 = _mm256_cmp_ps(bs.angle, MM256_SET1((float)M_PI * 0.25f), _CMP_GE_OQ);
 
 				mask1 = AND(mask1, mask0);
-
 				mask2 = AND(mask2, mask1);
-				mask3 = _mm256_andnot_ps(mask1, mask3);
+				mask3 = AND(mask3, mask2);
 
-				const auto s = nv_sin_8(_mm256_mul_ps(_mm256_set1_ps(1.5), _mm256_sub_ps(min_speed_angle_bonus, bs.angle)));
-
-				// Believe in the heart of the compiler.
-
-				//TODO: benchmark branching
-				const auto bonus3/*mul with bonus2*/ =					
-					_mm256_movemask_ps(mask3) == 0 ? _mm256_set1_ps(0.f) :
-						nv_sin_8(_mm256_mul_ps(_mm256_sub_ps(_mm256_set1_ps(M_PI * 0.5f), bs.angle), _mm256_set1_ps(1.27323954472)));
-
-				const auto bonus2 =
-					_mm256_movemask_ps(mask2) == 0 ? _mm256_set1_ps(0.f) :
-						_mm256_mul_ps(
-							_mm256_set1_ps(0.28f * 0.1f),
-							_mm256_min_ps(_mm256_sub_ps(_mm256_set1_ps(ANGLE_BONUS_SCALE), speed_distance), _mm256_set1_ps(1.f))
-						);
-
-				const auto bonus0 = _mm256_mul_ps(pow2_8(s), _mm256_set1_ps(1.f / 3.57f));
-
-				const auto bonus1 = _mm256_set1_ps(0.28f);
+				const auto bonus0 = (1.f / 3.57f) * pow2_8(nv_sin_8(1.5f * (SPEED_ANGLE_BONUS_BEGIN - bs.angle)));
+				const auto bonus2 = -0.28f * _mm256_min_ps(MM256_SET1(1.f), 0.1f * (ANGLE_BONUS_SCALE - speed_distance));
+				const auto bonus3 = _mm256_movemask_ps(mask3) == 0 ? _mm256_setzero_ps() :
+						nv_sin_8((4.f / M_PI) * (float(M_PI * 0.5f) - bs.angle))//might cause rounding issues?
+					;
 
 				angle_bonus = _mm256_blendv_ps(angle_bonus, bonus0, mask0);
-				angle_bonus = _mm256_blendv_ps(angle_bonus, bonus1, mask1);
-				angle_bonus = _mm256_blendv_ps(angle_bonus, bonus2, mask2);
-				angle_bonus = _mm256_blendv_ps(angle_bonus, _mm256_mul_ps(bonus3, bonus2), mask3);
-				angle_bonus = _mm256_add_ps(angle_bonus, _mm256_set1_ps(1.f));
+				angle_bonus = _mm256_blendv_ps(angle_bonus, MM256_SET1(0.28f), mask1);
+				angle_bonus = _mm256_blendv_ps(angle_bonus, 0.28f + bonus2, mask2);
+				angle_bonus = _mm256_blendv_ps(angle_bonus, 0.28f + bonus3 * bonus2, mask3);
+
+				angle_bonus = 1.f + angle_bonus;
+
 			}
 
 			#undef AND
 
-			const auto p0 = _mm256_mul_ps(angle_bonus, _mm256_add_ps(_mm256_set1_ps(1.f), _mm256_mul_ps(_mm256_set1_ps(0.75f), speed_bonus)));
-			const auto p1 = _mm256_add_ps( _mm256_set1_ps(0.95f),
-				_mm256_mul_ps(
-					_mm256_add_ps(speed_bonus, _mm256_set1_ps(1.f)),
-					pow_3p5_8(_mm256_mul_ps(speed_distance, _mm256_set1_ps(1.f / SINGLE_SPACING)))
-				)
-			);
+			const auto p0 = angle_bonus * (1.f + 0.75f * speed_bonus);
 
-			ret.strain_speed = _mm256_div_ps(_mm256_mul_ps(p0, p1), strain_time);
+			const auto p1 = 0.95f + (1.f + speed_bonus) * pow_3p5_8((1.f / SINGLE_SPACING) * speed_distance);
+
+			ret.strain_speed = (p0 * p1) / strain_time;
 
 		}
 
 		// Aim
 		{
 
-			const auto prev_strain_delta = _mm256_max_ps(_mm256_set1_ps(50.f), bs.p_delta);
+			const auto prev_strain_delta = _mm256_max_ps(MM256_SET1(50.f), bs.p_delta);
 
-			auto weighted_distance = pow_8(bs.distance, _mm256_set1_ps(0.99f));
+			auto weighted_distance = pow_8(bs.distance, MM256_SET1(0.99f));
 
-			{
-				const auto invalid_mask = _mm256_cmp_ps(bs.distance, _mm256_set1_ps(0.f), _CMP_LE_OQ);
-				weighted_distance = _mm256_blendv_ps(weighted_distance, _mm256_set1_ps(0.f), invalid_mask);
-			}
+			//remove invalid distances
+			weighted_distance = _mm256_and_ps(weighted_distance, _mm256_cmp_ps(bs.distance, MM256_SET1(0.f), _CMP_GT_OQ));
 
 			__m256 result;
 
@@ -477,37 +454,35 @@ namespace ocpp {
 				__m256 angle_bonus{ _mm256_set1_ps(0.f) };
 
 				{
-					const auto p0 = _mm256_max_ps(_mm256_sub_ps(bs.p_distance, _mm256_set1_ps(ANGLE_BONUS_SCALE)), _mm256_set1_ps(0.f));
-					const auto p1 = nv_sin_8(_mm256_sub_ps(bs.angle, _mm256_set1_ps(AIM_ANGLE_BONUS_BEGIN)));
-					const auto p2 = _mm256_max_ps(_mm256_sub_ps(bs.distance, _mm256_set1_ps(ANGLE_BONUS_SCALE)), _mm256_set1_ps(0.f));
+					const auto p0 = _mm256_max_ps(bs.p_distance - ANGLE_BONUS_SCALE, MM256_SET1(0.f));
+					const auto p1 = nv_sin_8(bs.angle - AIM_ANGLE_BONUS_BEGIN);
+					const auto p2 = _mm256_max_ps(bs.distance - ANGLE_BONUS_SCALE, MM256_SET1(0.f));
 					
-					angle_bonus = _mm256_sqrt_ps(_mm256_mul_ps(_mm256_mul_ps(p0, p2), pow2_8(p1)));
+					angle_bonus = _mm256_sqrt_ps(pow2_8(p1) * p0 * p2);
 				}
 
 
-				auto p1 = pow_8(_mm256_max_ps(angle_bonus, _mm256_set1_ps(0.f)), _mm256_set1_ps(0.99f));
+				auto p1 = pow_8(_mm256_max_ps(angle_bonus, MM256_SET1(0.f)), MM256_SET1(0.99f));
 				{
 					const auto invalid_mask = _mm256_cmp_ps(angle_bonus, _mm256_set1_ps(0.f), _CMP_LE_OQ);
 					p1 = _mm256_blendv_ps(p1, _mm256_set1_ps(0.f), invalid_mask);
 				}
 
-				const auto p2 = _mm256_div_ps(_mm256_set1_ps(1.f), _mm256_max_ps(bs.p_delta, _mm256_set1_ps(AIM_TIMING_THRESHOLD)));
-
-				const auto p3 = _mm256_mul_ps(_mm256_mul_ps(p1, _mm256_set1_ps(1.5f)), p2);
+				const auto p2 = (1.5f * p1) / _mm256_max_ps(bs.p_delta, MM256_SET1(AIM_TIMING_THRESHOLD));
 
 				result = 
-					_mm256_blendv_ps(_mm256_set1_ps(0.f), p3, _mm256_cmp_ps(bs.angle, _mm256_set1_ps(AIM_ANGLE_BONUS_BEGIN), _CMP_GT_OQ));
+					_mm256_blendv_ps(MM256_SET1(0.f), p2, _mm256_cmp_ps(bs.angle, MM256_SET1(AIM_ANGLE_BONUS_BEGIN), _CMP_GT_OQ));
 
 			}
 
-			const __m256 vel = _mm256_div_ps(weighted_distance, _mm256_max_ps(_mm256_set1_ps(AIM_TIMING_THRESHOLD), strain_time));
+			const auto vel = weighted_distance / _mm256_max_ps(MM256_SET1(AIM_TIMING_THRESHOLD), strain_time);
 
-			ret.strain_aim = _mm256_max_ps(_mm256_add_ps(result, vel), _mm256_div_ps(weighted_distance, strain_time));
+			ret.strain_aim = _mm256_max_ps(result + vel, weighted_distance / strain_time);
 
 		}	
 
-		ret.strain_speed = _mm256_mul_ps(ret.strain_speed, _mm256_set1_ps(weight_scaling[DIFF_SPEED]));
-		ret.strain_aim = _mm256_mul_ps(ret.strain_aim, _mm256_set1_ps(weight_scaling[DIFF_AIM]));
+		ret.strain_speed = weight_scaling[DIFF_SPEED] * ret.strain_speed;
+		ret.strain_aim = weight_scaling[DIFF_AIM] * ret.strain_aim;
 
 		return ret;
 	}
@@ -570,13 +545,12 @@ namespace ocpp {
 
 				DO(0); DO(1); DO(2); DO(3); DO(4); DO(5); DO(6); DO(7);
 
-				const auto _diff = _mm256_mul_ps(strains, _mm256_load_ps(_weight.data()));
-
-				sum2 = _mm256_add_ps(sum2, _diff);
+				sum2 = sum2 + strains * _mm256_load_ps(_weight.data());
 
 				if constexpr (skip_strain_length_total == 0) {
-					const auto _star = pow_8(strains, _mm256_set1_ps(1.2f));
-					sum = _mm256_add_ps(sum, _star);
+
+					sum = sum + pow_8(strains, MM256_SET1(1.2f));
+
 				}
 
 				#undef DO
@@ -587,10 +561,9 @@ namespace ocpp {
 
 			if constexpr (skip_strain_length_total == 0){
 
-				for (; i + 8 <= real_size; i += 8) {
-					const auto _star = pow_8(_mm256_load_ps(&vec[i]), _mm256_set1_ps(1.2f));
-					sum = _mm256_add_ps(sum, _star);
-				}
+				for (; i + 8 <= real_size; i += 8)
+					sum = sum + pow_8(_mm256_load_ps(&vec[i]), MM256_SET1(1.2f));
+
 			}
 
 			total = _256_HADD(sum);
@@ -673,7 +646,7 @@ namespace ocpp {
 
 		const _hit_object* last{ &pp.objects[0] };
 
-		float previous_distance{}, previous_delta{};
+		float previous_delta{};
 
 		float p_speed_strain{}, p_aim_strain{};
 
@@ -685,42 +658,49 @@ namespace ocpp {
 
 			const auto& n = pp.objects[i];
 
-			//if ((n.type & (OBJ_CIRCLE | OBJ_SLIDER)) == 0) continue;		
-
 			batch.note_id[c] = i;
 			batch.angle.m256_f32[c] = n.angle;// Might want to blit this properly.
 
 			batch.p_delta.m256_f32[c] = previous_delta;
 
 			batch.delta.m256_f32[c] = (previous_delta = ((n.time - last->time) * rspeed));
-			batch.distance.m256_f32[c] = (previous_distance = (n.norm_pos - last->norm_pos).length2());
+
+			// This gets the distance from the previous note even if its a spinner, might be unintentional but it's how oppai is 
+			batch.distance.m256_f32[c] = n.type & (OBJ_CIRCLE | OBJ_SLIDER) ? (n.norm_pos - last->norm_pos).length2() : 0.f;
 
 			last = &n;
 
 			if (++c == 8 || i + 1 == size) {
 
+				// Difference p_distance is based off previous note even if its a spinner
+
 				batch.distance = _mm256_sqrt_ps(batch.distance);
 
-				batch.p_distance.m256_f32[0] = last_pdistance;
+				batch.p_distance = _mm256_permutevar8x32_ps(batch.distance, _mm256_set_epi32(6, 5, 4, 3, 2, 1,0, 7));
 
-				memcpy(&batch.p_distance.m256_f32[1], &batch.distance.m256_f32[0], sizeof(batch.distance) - sizeof(float));
+				batch.p_distance = _mm256_blend_ps(batch.p_distance, _mm256_set1_ps(last_pdistance), 1);
 
 				last_pdistance = batch.distance.m256_f32[7];
 
-				const auto&__restrict ret = calc_strain_batch(batch);
+				const auto& ret = calc_strain_batch(batch);
 
 				for (size_t z{}; z < c; ++z) {
 
-					const float speed_strain = p_speed_strain * ret.decay_speed.m256_f32[z] + ret.strain_speed.m256_f32[z];
-					const float aim_strain = p_aim_strain * ret.decay_aim.m256_f32[z] + ret.strain_aim.m256_f32[z];
+					const auto& note = pp.objects[batch.note_id[z]];
+					
+					const bool is_note = note.type & (OBJ_CIRCLE | OBJ_SLIDER);
 
-					const auto c_time = pp.objects[batch.note_id[z]].time;
+					const float speed_strain = p_speed_strain * ret.decay_speed.m256_f32[z] + (is_note ? ret.strain_speed.m256_f32[z] : 0.f);
+					const float aim_strain = p_aim_strain * ret.decay_aim.m256_f32[z] + (is_note ? ret.strain_aim.m256_f32[z] : 0.f);
+
+					const auto c_time = note.time;
 
 					d_update_max_strains(pp, c_time, last_time, { speed_strain, p_speed_strain }, { aim_strain, p_aim_strain });
 
 					last_time = c_time;
 					p_speed_strain = speed_strain;
 					p_aim_strain = aim_strain;
+					
 				}
 
 				c = 0;
@@ -1095,8 +1075,8 @@ namespace ocpp {
 					if (i >= 2) {
 
 						{
-							auto& prev1 = pp.objects[i - 1];
-							auto& prev2 = pp.objects[i - 2];
+							const auto& prev1 = pp.objects[i - 1];
+							const auto& prev2 = pp.objects[i - 2];
 
 							vec2 v1 = prev2.norm_pos - prev1.norm_pos;
 							vec2 v2 = cur.norm_pos - prev1.norm_pos;
@@ -1111,6 +1091,15 @@ namespace ocpp {
 
 							cur.timing_index = adv_timing(cur.time, next_timing_node, timing_index);;
 
+							if ((cur.type & OBJ_SLIDER) == 0)
+								continue;
+
+							const auto& t{ pp.timing[timing_index] };
+
+							cur.duration = cur.distance * float(cur.repeats) * t.velocity;
+
+							pp.max_combo += cur.get_combo_count(t.px_per_beat, pp.diff.slider_tickrate);
+
 						}
 
 					} else {
@@ -1124,11 +1113,11 @@ namespace ocpp {
 				_hit_object* const start_ptr = &pp.objects[0];
 				_hit_object* const end_ptr = &pp.objects.back();
 
+				MM_ALIGN float _dot[8], _det[8];
+
 				for (size_t i{}, size{ pp.objects.size() }; i < size; i += 8) {
 
 					_hit_object* start{ start_ptr + i };
-
-					MM_ALIGN std::array<std::array<float, 8>, 4> uv;
 
 					for (size_t z{}; z < 8; ++z) {// TODO: see if its worth vecorizing this
 
@@ -1139,38 +1128,23 @@ namespace ocpp {
 						const _hit_object* prev1 = std::max(cur - 1, start_ptr);
 						const _hit_object* prev2 = std::max(cur - 2, start_ptr);
 
-						vec2 v1 = prev2->norm_pos - prev1->norm_pos;
-						vec2 v2 = cur->norm_pos - prev1->norm_pos;
+						const vec2 v1 = prev2->norm_pos - prev1->norm_pos;
+						const vec2 v2 = cur->norm_pos - prev1->norm_pos;
 
-						vec2 v3 = vec2(1.f,1.f) - vec2(0.5f,0.5f);
-
-						const u32 is_inf{ u32(v1.length2() == 0.f) + (u32(v2.length2() == 0.f) << 1) };
-
-						if (is_inf) [[unlikely]]{
-							if (is_inf == 3)
-								v2 = (v1 = vec2{ 1.f,0.f });
-							else if (is_inf == 2)
-								v2 = v1;
-							else
-								v1 = v2;
-						}
-
-						uv[0][z] = v1.x;
-						uv[1][z] = v1.y;
-						uv[2][z] = v2.x;
-						uv[3][z] = v2.y;
+						_dot[z] = dot(v1, v2);
+						_det[z] = v1.x * v2.y - v1.y * v2.x;
 
 					}
 
-					MM_ALIGN /*redundant*/ std::array<float, 8> res;
-
-					_mm256_store_ps(res.data(), nv_acos_8(dot_4_8(uv)));// There is probably a more efficent optimization where the angle is actually used
+					_mm256_store_ps(_dot,abs_8(
+						nv_atan2_8(_mm256_load_ps(_det), _mm256_load_ps(_dot))
+					));// There is probably a more efficent optimization where the angle is actually used
 
 					for (size_t z{}; z < 8; ++z) {
 
 						auto& c = pp.objects[std::min(i + z, size - 1)];
 
-						c.angle = res[z];												
+						c.angle = _dot[z];
 
 						c.timing_index = adv_timing(c.time, next_timing_node, timing_index);
 
