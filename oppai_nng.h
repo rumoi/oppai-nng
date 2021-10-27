@@ -1,12 +1,14 @@
 #pragma once
 
 // Requires c++20 and AVX2
+// Currently 7.5-8x faster than oppai-ng
+// Around E-6 accuracy. Assuming an oppai-ng using a fixed atan2
 
 // MSVC notes
 // Dont forget to compile with /arch:AVX2 - 25% speed increase
-// Might want to compile to x86. MSVC sometimes sucks at generating x64 AVX, also allows /Oy to be used
+// MSVC seems better in aggregate with x64
 
-// GCC would require at least: -std=c++20 -mavx2 -mfma -O2
+// GCC would require at least: -std=c++20 -mavx2 -mfma -march=native -O2
 
 // Not particularly focused on stable parity. Could change in the future.
 
@@ -25,7 +27,21 @@
 
 #define MM_ALIGN __declspec(align(32))
 
+#ifdef _MSC_VER
+#define BSF(mask) _tzcnt_u32(mask)
+#else
+#define BSF(mask) __builtin_ctz(mask)
+#endif
+
 #include "AVX.h"
+
+namespace std {
+	_inline void from_chars(const char* x, const char* y, std::string_view& v) noexcept{// lmao
+		v = std::string_view(x, y - x);
+	}
+}
+
+#define from_sv(sv, out) (std::from_chars(sv.data(), sv.data() + sv.size(), out))
 
 namespace ocpp {
 
@@ -33,6 +49,8 @@ namespace ocpp {
 
 	constexpr bool AVX_angle_calc{ 1 }; // Huge performance win
 	constexpr bool AVX_strain_sum{ 1 }; // Slightly changes accuracy, but takes it from 2*0.23ms -> 2*0.012ms on my machine
+	constexpr bool AVX_get_line{ 1 }; // 0.033ms -> 0.013ms
+	constexpr bool AVX_split_line{ 1 }; // ?ms -> ?ms
 
 	// After 829 iterations weight gets denormalized, which in most cases is treated as a zero
 	// 832 just allows it to neatly fit in the avx batch
@@ -43,7 +61,7 @@ namespace ocpp {
 	//Occlude low strain values, inaccuracy liberties lead to the strain data to be quite noisy so a 0 compare is mute.
 	constexpr float strain_cut_off{0.5e-3f};
 
-	constexpr size_t TIMING_CHUNKS{ 64 }, NOTE_CHUNKS{ 512 };
+	constexpr size_t TIMING_CHUNKS{ 128 }, NOTE_CHUNKS{ 512 };
 
 	constexpr size_t DIFF_SPEED{ 0 }, DIFF_AIM{ 1 };
 
@@ -56,8 +74,8 @@ namespace ocpp {
 					MIN_SPEED_BONUS{ 75.0f }, /* ~200BPM 1/4 streams */
 					ANGLE_BONUS_SCALE{ 90.f },
 					AIM_TIMING_THRESHOLD{ 107.f },
-					SPEED_ANGLE_BONUS_BEGIN{ 5 * M_PI / 6.f },
-					AIM_ANGLE_BONUS_BEGIN{ M_PI / 3.f };
+					SPEED_ANGLE_BONUS_BEGIN{ 5.f * (float)M_PI / 6.f },
+					AIM_ANGLE_BONUS_BEGIN{ (float)M_PI / 3.f };
 
 	constexpr float decay_base[] = { 0.3f, 0.15f }; /* strains decay per interval */
 	constexpr float weight_scaling[] = { 1400.0f, 26.25f }; /* balances aim/speed */
@@ -120,6 +138,9 @@ namespace ocpp {
 
 		vec2 operator-(const vec2&__restrict B) __restrict const noexcept{
 			return vec2{ x - B.x, y - B.y };
+		}
+		vec2 operator+(const vec2& __restrict B) __restrict const noexcept{
+			return vec2{ x + B.x, y + B.y };
 		}
 
 		float operator[](const size_t i) const { return i ? y : x;}
@@ -291,7 +312,7 @@ namespace ocpp {
 		float max_strain[2];
 		float speed_mul;
 
-		char buff[0xFFFF];
+		MM_ALIGN char buff[0xFFFF];
 
 		void acc_round_normal(float acc_percent, int misses, _score_stats& ss) {
 
@@ -445,27 +466,27 @@ namespace ocpp {
 			auto weighted_distance = pow_8(bs.distance, MM256_SET1(0.99f));
 
 			//remove invalid distances
-			weighted_distance = _mm256_and_ps(weighted_distance, _mm256_cmp_ps(bs.distance, MM256_SET1(0.f), _CMP_GT_OQ));
+			weighted_distance = _mm256_and_ps(weighted_distance, _mm256_cmp_ps(bs.distance, _mm256_setzero_ps(), _CMP_GT_OQ));
 
 			__m256 result;
 
 			{
 
-				__m256 angle_bonus{ _mm256_set1_ps(0.f) };
+				__m256 angle_bonus;
 
 				{
-					const auto p0 = _mm256_max_ps(bs.p_distance - ANGLE_BONUS_SCALE, MM256_SET1(0.f));
+					const auto p0 = _mm256_max_ps(bs.p_distance - ANGLE_BONUS_SCALE, _mm256_setzero_ps());
 					const auto p1 = nv_sin_8(bs.angle - AIM_ANGLE_BONUS_BEGIN);
-					const auto p2 = _mm256_max_ps(bs.distance - ANGLE_BONUS_SCALE, MM256_SET1(0.f));
+					const auto p2 = _mm256_max_ps(bs.distance - ANGLE_BONUS_SCALE, _mm256_setzero_ps());
 					
 					angle_bonus = _mm256_sqrt_ps(pow2_8(p1) * p0 * p2);
 				}
 
 
-				auto p1 = pow_8(_mm256_max_ps(angle_bonus, MM256_SET1(0.f)), MM256_SET1(0.99f));
+				auto p1 = pow_8(_mm256_max_ps(angle_bonus, _mm256_setzero_ps()), MM256_SET1(0.99f));
 				{
-					const auto invalid_mask = _mm256_cmp_ps(angle_bonus, _mm256_set1_ps(0.f), _CMP_LE_OQ);
-					p1 = _mm256_blendv_ps(p1, _mm256_set1_ps(0.f), invalid_mask);
+					const auto invalid_mask = _mm256_cmp_ps(angle_bonus, _mm256_setzero_ps(), _CMP_LE_OQ);
+					p1 = _mm256_blendv_ps(p1, _mm256_setzero_ps(), invalid_mask);
 				}
 
 				const auto p2 = (1.5f * p1) / _mm256_max_ps(bs.p_delta, MM256_SET1(AIM_TIMING_THRESHOLD));
@@ -724,34 +745,113 @@ namespace ocpp {
 
 	}
 
+	_inline u8 get_line(std::string_view& __restrict range, std::string_view& __restrict out) {
 
+		// Occludes last line, not an issue in .osu
 
-	_inline bool get_line(std::string_view& __restrict range, std::string_view& __restrict out) {
+		size_t i{}, size{ range.size() };
+
+		if constexpr (AVX_get_line) {
+
+			// 16 is better than 32 on average.
+			// Tried doing 32 with multi line return but it increased code complexity greatly -
+			// with the performance gain being far too minor.
+
+			for (; i + 16 < size; i += 16) {
+
+				const u32 mask = _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_loadu_si128((__m128i*)&range[i]), _mm_set1_epi8('\n')));
+
+				if (mask == 0) continue;
+
+				const u32 in = i + BSF(mask);
+
+				out = range.substr(0, in);
+				range = range.substr((size_t)in + 1);
+
+				return 1;
+			}
+
+		}
 
 		for (size_t i{}, size{ range.size() }; i < size; ++i) {
 
 			if (range[i] == '\n') [[unlikely]] {
 
-				out = std::string_view(range.data(), i);
-				range = std::string_view(range.data() + i + 1, range.size() - (i + 1));
+				out = range.substr(0,i);
+				range = range.substr(i + 1);
 
 				return 1;
 			}
+
 		}
 
 		return 0;
 	}
 
 	template<char delim, typename ...T>
-	 const std::tuple<T...>& split_line(std::string_view line, std::tuple<T...>& v) {
+	const std::tuple<T...>& split_line_AVX(std::string_view line, std::tuple<T...>& v) {
+
+		constexpr size_t param_count = sizeof...(T);
+
+		size_t i{}, size{ line.size() }, start{};
+
+		u8 c_v{};
+		std::string_view s_view[param_count];
+
+		for (; i + 16 < size; i += 16) {
+
+			const auto v = _mm_loadu_si128((__m128i*)&line[i]);
+
+			u32 mask = _mm_movemask_epi8(_mm_cmpeq_epi8(v, _mm_set1_epi8(delim)));
+
+			while (mask) {
+
+				const auto index = BSF(mask);
+
+				s_view[c_v++] = line.substr(start, i + index);
+
+				if (c_v == param_count) [[unlikely]]
+					goto finish;
+
+				start = std::min(1 + i + index, size - 1);
+
+				mask ^= 1 << index;
+			}
+
+		}
+		for (; i < size; ++i) {
+
+			if (line[i] != delim)
+				continue;
+
+			s_view[c_v++] = line.substr(start, i);
+
+			if (c_v == param_count) [[unlikely]] break;
+
+			start = std::min(1 + i, size - 1);
+
+		}
+
+	finish:
+
+		[&v, &s_view]<size_t... i>(std::index_sequence<i...>) {
+			(from_sv(s_view[i], std::get<i>(v)), ...);
+		}(std::make_index_sequence<param_count> {});
+
+		return v;
+	}
+
+	template<char delim, typename ...T>
+	 _inline const std::tuple<T...>& split_line(std::string_view line, std::tuple<T...>& v) {
+
+		 if constexpr (AVX_split_line)
+			 return split_line_AVX<delim>(line, v);
 
 		size_t i{}, size{ line.size() }, start{};
 
 		std::apply(
 			[&](auto&... value_pack){
 				(([&](auto& value){
-
-					using _t = std::remove_cvref<decltype(value)>::type;
 
 					if (i >= size)
 						return;
@@ -761,9 +861,7 @@ namespace ocpp {
 						continue;
 					}
 
-					if constexpr (std::is_same<_t, std::string_view>::value) {
-						value = std::string_view(line.data() + start, line.data() + (i >= size ? size : i));
-					} else std::from_chars(line.data() + start, line.data() + (i >= size ? size : i), value);
+					std::from_chars(line.data() + start, line.data() + std::min(i, size), value);
 
 					start = std::min(++i, size - 1);
 		
@@ -823,11 +921,10 @@ namespace ocpp {
 
 	void parse_note(_pp_meta& pp, std::string_view line) {
 
-		using hit_object = std::tuple<int, int, int, u8, u8, std::string_view, int, float, std::string_view>;
+		using hit_object = std::tuple<int, int, int, u8, u8, std::string_view, int, float/*, std::string_view*/>;
 
 		hit_object temp;
-
-		const auto& [x, y, time, type, hitSound, slider_param,repeats, distance, edgesounds] { split_line<','>(line, temp) };
+		const auto& [x, y, time, type, hitSound, slider_param,repeats, distance/*, edgesounds*/] { split_line<','>(line, temp) };
 
 		_hit_object ho{};
 
@@ -855,12 +952,12 @@ namespace ocpp {
 
 	#undef PARSE
 
-	void parse_line(_pp_meta& pp, std::string_view line) {	
+	_inline void parse_line(_pp_meta& pp, std::string_view line){
 
 		size_t l_size{ line.size() };
 
-		if (l_size && line[l_size - 1] == '\r')// Clip windows return carriage
-			line = std::string_view(line.data(), l_size -= 1);
+		if (l_size)// Clip windows return carriage
+			line = line.substr(0, l_size -= (line[l_size - 1] == '\r'));
 
 		if (l_size == 0)
 			return;
@@ -882,14 +979,12 @@ namespace ocpp {
 			return;
 		}
 
-		if(pp.parse_mode == pp.parse_hitobjects)
-			parse_note(pp, line);
-		else if (pp.parse_mode == pp.parse_timingpoints)
-			parse_timing(pp, line);
-		else if (pp.parse_mode == pp.parse_difficulty)
-			parse_difficulty(pp, line);
-		else
-			parse_general(pp, line);
+		switch (pp.parse_mode) {// Borderline
+			case pp.parse_hitobjects: return parse_note(pp, line);
+			case pp.parse_timingpoints: return parse_timing(pp, line);
+			case pp.parse_difficulty: return parse_difficulty(pp, line);
+			default: return parse_general(pp, line);
+		}
 
 	}
 
@@ -923,8 +1018,12 @@ namespace ocpp {
 
 					std::string_view _memory(pp.buff, read_size);
 
-					for (std::string_view line; get_line(_memory, line);)
-						parse_line(pp, line);
+					{
+						
+						for (std::string_view line; get_line(_memory, line); )
+							parse_line(pp, line);
+
+					}
 
 					if (_memory.data() == pp.buff) {
 						// Single line was larger than the pp.buff length
@@ -1179,6 +1278,17 @@ namespace ocpp {
 
 	float calc_pp_8(_pp_meta& pp, const std::array<_score_stats*, 8> scores) {
 
+		const int ncircles{ pp.c_note };
+		const int nobjects{ (int)pp.objects.size() };
+
+		const float nobjects_over_2k = float(nobjects) / 2000.0f;
+
+		const float length_bonus = (
+			0.95f +
+			0.4f * std::min(1.0f, nobjects_over_2k) +
+			(nobjects > 2000 ? (float)log10(nobjects_over_2k) * 0.5f : 0.0f)
+			);
+
 
 
 		return 0;
@@ -1305,4 +1415,6 @@ namespace ocpp {
 	#undef PCAT1
 	#undef PCAT2
 	#undef ON_SCOPE_EXIT
+	#undef from_sv
+
 }
