@@ -32,6 +32,12 @@
 #else
 #define BSF(mask) __builtin_ctz(mask)
 #endif
+#ifdef _MSC_VER
+#define BSF64(mask) _tzcnt_u64(mask)
+#else
+#define BSF64(mask) __builtin_ctzll(mask)
+#endif
+
 
 #include "AVX.h"
 
@@ -164,8 +170,10 @@ namespace ocpp {
 		/* taiko stuff */
 		float beat_len;
 		float velocity;
-
+		u8 pad[5];
 	};
+
+	static_assert(sizeof _timing == 32);//two per cache line
 
 	struct _hit_object { // Pretty memory chunky
 
@@ -173,11 +181,11 @@ namespace ocpp {
 
 		u32 type : 4, repeats : 16 /*repeats might be 15, check it later*/, timing_index : 12;
 		float time;
-		float duration;
+		//float duration;
 		vec2 pos;
 		vec2 norm_pos;
 		float angle;
-		
+
 		float distance;
 
 		int get_combo_count(const float px_per_beat, const float tick_rate)__restrict const noexcept{
@@ -206,6 +214,8 @@ namespace ocpp {
 
 
 	};
+
+	static_assert(sizeof _hit_object == 32);//two per cache line
 
 	#define MODS_NOMOD 0
 	#define MODS_NF (1<<0)
@@ -291,6 +301,8 @@ namespace ocpp {
 
 		u32 parse_mode : 2, version:5, mode:2, strain_spawn_thread:1;
 
+		u32 beatmap_id, set_id;
+
 		struct {
 			float HP, CS, OD, AR, slider_multiplier, slider_tickrate;
 		} diff;
@@ -305,8 +317,9 @@ namespace ocpp {
 		std::vector<_hit_object> objects;
 		std::vector<_timing> timing;
 
-		std::vector<MM_ALIGN float> speed_highest_strains;
-		std::vector<MM_ALIGN float> aim_highest_strains;
+		// Aligned on a 32b boundary on msvc at least
+		std::vector<float> speed_highest_strains;
+		std::vector<float> aim_highest_strains;
 
 		float interval_end;
 		float max_strain[2];
@@ -538,7 +551,7 @@ namespace ocpp {
 
 	}
 	
-	void d_weigh_individual(std::vector<float>& vec, float& star, float& diff) {
+	void d_weigh_individual(std::vector<float>& /*must be 32 aligned*/ vec, float& star, float& diff) {
 		
 		if (vec.size() > u32(strain_weight_max_interation * 1.5f))
 			std::partial_sort(vec.begin(), vec.begin() + strain_weight_max_interation, vec.end(), std::greater<float>());
@@ -677,6 +690,8 @@ namespace ocpp {
 
 		//MM_ALIGN __m256 max_strain[2]{}; was going to use to help with sorting
 
+		const auto mem_start = (const char*)pp.objects.data();
+
 		for (size_t i{1}, size{ pp.objects.size() }; i < size; ++i) {
 
 			const auto& n = pp.objects[i];
@@ -693,13 +708,13 @@ namespace ocpp {
 
 			last = &n;
 
-			if (++c == 8 || i + 1 == size) {
+			if (++c == 8 || i + 1 == size) [[unlikely]] {
 
 				// Difference p_distance is based off previous note even if its a spinner
 
 				batch.distance = _mm256_sqrt_ps(batch.distance);
 
-				batch.p_distance = _mm256_permutevar8x32_ps(batch.distance, _mm256_set_epi32(6, 5, 4, 3, 2, 1,0, 7));
+				batch.p_distance = _mm256_permutevar8x32_ps(batch.distance, _mm256_set_epi32(6, 5, 4, 3, 2, 1, 0, 7));
 
 				batch.p_distance = _mm256_blend_ps(batch.p_distance, _mm256_set1_ps(last_pdistance), 1);
 
@@ -789,7 +804,7 @@ namespace ocpp {
 	}
 
 	template<char delim, typename ...T>
-	const std::tuple<T...>& split_line_AVX(std::string_view line, std::tuple<T...>& v) {
+	const std::tuple<T...>& split_line_AVX(const std::string_view& line, std::tuple<T...>& v) {
 
 		constexpr size_t param_count = sizeof...(T);
 
@@ -808,7 +823,7 @@ namespace ocpp {
 
 				const auto index = BSF(mask);
 
-				s_view[c_v++] = line.substr(start, i + index);
+				s_view[c_v++] = line.substr(start, (i + index) - start);
 
 				if (c_v == param_count) [[unlikely]]
 					goto finish;
@@ -819,18 +834,22 @@ namespace ocpp {
 			}
 
 		}
+
 		for (; i < size; ++i) {
 
 			if (line[i] != delim)
 				continue;
 
-			s_view[c_v++] = line.substr(start, i);
+			s_view[c_v++] = line.substr(start, i - start);
 
 			if (c_v == param_count) [[unlikely]] break;
 
 			start = std::min(1 + i, size - 1);
 
 		}
+
+		if(c_v != param_count)
+			s_view[c_v++] = line.substr(start);
 
 	finish:
 
@@ -842,10 +861,10 @@ namespace ocpp {
 	}
 
 	template<char delim, typename ...T>
-	 _inline const std::tuple<T...>& split_line(std::string_view line, std::tuple<T...>& v) {
+	 _inline const std::tuple<T...>& split_line(const std::string_view& line, std::tuple<T...>& v) {
 
-		 if constexpr (AVX_split_line)
-			 return split_line_AVX<delim>(line, v);
+		if constexpr (AVX_split_line)
+			return split_line_AVX<delim>(line, v);
 
 		size_t i{}, size{ line.size() }, start{};
 
@@ -870,6 +889,7 @@ namespace ocpp {
 			}, v
 		);
 
+
 		return v;
 	}
 
@@ -884,7 +904,8 @@ namespace ocpp {
 	void parse_general(_pp_meta& pp, std::string_view line) {
 
 		PARSE("osu file format v", pp.version);
-		PARSE("Mode: ", pp.mode);
+		PARSE("BeatmapID:", pp.beatmap_id);
+		PARSE("BeatmapSetID:", pp.set_id);
 
 	}
 
@@ -966,14 +987,11 @@ namespace ocpp {
 			
 			if (line == "[Difficulty]"sv)
 				pp.parse_mode = pp.parse_difficulty;
-
-			if (line == "[TimingPoints]"sv)
+			else if (line == "[TimingPoints]"sv)
 				pp.parse_mode = pp.parse_timingpoints;
-
-			if (line == "[HitObjects]"sv)
+			else if (line == "[HitObjects]"sv)
 				pp.parse_mode = pp.parse_hitobjects;
-
-			if (line == "[Colours]"sv)
+			else if (line == "[Colours]"sv)
 				pp.parse_mode = 0;
 
 			return;
@@ -1018,12 +1036,8 @@ namespace ocpp {
 
 					std::string_view _memory(pp.buff, read_size);
 
-					{
-						
-						for (std::string_view line; get_line(_memory, line); )
-							parse_line(pp, line);
-
-					}
+					for (std::string_view line; get_line(_memory, line); )
+						parse_line(pp, line);
 
 					if (_memory.data() == pp.buff) {
 						// Single line was larger than the pp.buff length
@@ -1197,7 +1211,7 @@ namespace ocpp {
 
 							const auto& t{ pp.timing[timing_index] };
 
-							cur.duration = cur.distance * float(cur.repeats) * t.velocity;
+							//cur.duration = cur.distance * float(cur.repeats) * t.velocity;
 
 							pp.max_combo += cur.get_combo_count(t.px_per_beat, pp.diff.slider_tickrate);
 
@@ -1211,12 +1225,21 @@ namespace ocpp {
 
 			} else {
 
+
 				_hit_object* const start_ptr = &pp.objects[0];
 				_hit_object* const end_ptr = &pp.objects.back();
 
 				MM_ALIGN float _dot[8], _det[8];
 
 				for (size_t i{}, size{ pp.objects.size() }; i < size; i += 8) {
+
+					//{
+					//	const char* b = (const char*)&pp.objects[i];
+					//	_mm_prefetch(b + 4096 + 0, _MM_HINT_T0);
+					//	_mm_prefetch(b + 4096 + 64, _MM_HINT_T0);
+					//	_mm_prefetch(b + 4096 + 128, _MM_HINT_T0);
+					//	_mm_prefetch(b + 4096 + 192, _MM_HINT_T0);
+					//}
 
 					_hit_object* start{ start_ptr + i };
 
@@ -1254,7 +1277,7 @@ namespace ocpp {
 
 						const auto& t{ pp.timing[timing_index] };
 
-						c.duration = c.distance * float(c.repeats) * t.velocity;
+						//c.duration = c.distance * float(c.repeats) * t.velocity;
 
 						pp.max_combo += c.get_combo_count(t.px_per_beat, pp.diff.slider_tickrate);
 

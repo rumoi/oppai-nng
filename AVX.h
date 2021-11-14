@@ -1,16 +1,5 @@
 #pragma once
 
-enum _compiler_version{ MSVC = 0, CLANG, GCC };
-
-#if defined(__clang__)
-	constexpr auto compiler_version = CLANG;
-#elif defined(__GNUC__) || defined(__GNUG__)
-	constexpr auto compiler_version = GCC;
-#elif defined(_MSC_VER)
-	constexpr auto compiler_version = MSVC;
-#endif
-
-
 #include <bit>
 #include <immintrin.h>
 #include <array>
@@ -85,7 +74,7 @@ __m256 nv_sin_8(__m256 x) {
 		r1_z = _mm256_fmadd_ps(r0_z, MM256_SET1(c2.x), MM256_SET1(c2.z));
 	}
 
-	#define DO(_x,_y,_z)\
+#define DO(_x,_y,_z)\
 		r1_x = _mm256_fmadd_ps(r1_x, r0_x, MM256_SET1(_x));\
 		r1_y = _mm256_fmadd_ps(r1_y, r0_y, MM256_SET1(_y));\
 		r1_z = _mm256_fmadd_ps(r1_z, r0_z, MM256_SET1(_z));
@@ -95,14 +84,14 @@ __m256 nv_sin_8(__m256 x) {
 	DO(c4.x, c4.y, c4.x);
 	DO(c4.z, c4.w, c4.z);
 
-	#undef DO
-	
+#undef DO
+
 	//return _mm256_fmadd_ps(r1_z, r2_z, (r1_y * r2_y) + (r1_x * r2_x));
 	return (r1_z * r2_z) + (r1_y * r2_y) + (r1_x * r2_x);// range extract
 }
 
 __m256 dot_4_8(const std::array<std::array<float, 8>, 4>& __restrict/*must be 32 aligned*/ x) {
-	
+
 	auto X1 = _mm256_load_ps(&x[0][0]);
 	auto Y1 = _mm256_load_ps(&x[1][0]);
 	auto X2 = _mm256_load_ps(&x[2][0]);
@@ -122,7 +111,7 @@ __m256 dot_4_8(const std::array<std::array<float, 8>, 4>& __restrict/*must be 32
 	}
 
 	auto DOT = _mm256_fmadd_ps(X1, X2, Y1 * Y2);
-	
+
 	// Clamp between -1 and 1
 	DOT = _mm256_min_ps(DOT, MM256_SET1(1.f));
 
@@ -135,7 +124,7 @@ __m256 nv_acos_8(__m256 x) {
 
 	const auto negate = _mm256_and_ps(MM256_SET1(1.f), _mm256_cmp_ps(x, _mm256_setzero_ps(), _CMP_LT_OQ));
 
-	x = _mm256_and_ps(x, MM256_SET1(std::bit_cast<float>(0x7FFFFFFF)));
+	x = abs_8(x);
 
 	auto y = _mm256_fmadd_ps(x, MM256_SET1(-0.0187293f), MM256_SET1(0.0742610f));
 
@@ -147,13 +136,12 @@ __m256 nv_acos_8(__m256 x) {
 	return _mm256_fmadd_ps(negate, MM256_SET1((float)M_PI), y);
 }
 
-__m256 nv_atan2_8(__m256 y, __m256 x){
+__m256 nv_atan2_8(__m256 y, __m256 x) {
 
 	//https://developer.download.nvidia.com/cg/atan2.html
 
-	const auto x_abs = _mm256_and_ps(x, MM256_SET1(std::bit_cast<float>(0x7FFFFFFF)));;
-	const auto y_abs = _mm256_and_ps(y, MM256_SET1(std::bit_cast<float>(0x7FFFFFFF)));;
-	
+	const auto x_abs = abs_8(x), y_abs = abs_8(y);
+
 	const auto invalid = _mm256_and_ps(
 		_mm256_cmp_ps(x, _mm256_setzero_ps(), _CMP_EQ_OQ),
 		_mm256_cmp_ps(y, _mm256_setzero_ps(), _CMP_EQ_OQ)
@@ -163,18 +151,18 @@ __m256 nv_atan2_8(__m256 y, __m256 x){
 
 	const auto sqr = r * r;
 
-	#define DO(x) t0 = _mm256_fmadd_ps(t0, sqr, MM256_SET1(x))
-
 	auto t0 = _mm256_fmadd_ps(MM256_SET1(-0.013480470f), sqr, MM256_SET1(0.057477314f));
+
+#define DO(x) t0 = _mm256_fmadd_ps(t0, sqr, MM256_SET1(x))
 
 	DO(-0.121239071f);
 	DO(0.195635925f);
 	DO(-0.332994597f);
 	DO(0.999995630f);
 
-	auto res = t0 * r;
+#undef DO
 
-	#undef DO
+	auto res = t0 * r;
 
 	res = _mm256_blendv_ps(res, 1.570796327f - res, _mm256_cmp_ps(y_abs, x_abs, _CMP_GT_OQ));
 	res = _mm256_blendv_ps(res, 3.141592654f - res, _mm256_cmp_ps(x, _mm256_setzero_ps(), _CMP_LT_OQ));
@@ -224,7 +212,7 @@ __m256 intel_log_8(__m256 x) {
 	y = y * sqr_x;
 
 	y = _mm256_fmadd_ps(e, MM256_SET1(-2.12194440e-4f), y);
-	y = _mm256_fmadd_ps(sqr_x,  MM256_SET1(-0.5f), y);
+	y = _mm256_fmadd_ps(sqr_x, MM256_SET1(-0.5f), y);
 
 	x = _mm256_fmadd_ps(e, MM256_SET1(0.693359375f), x + y);
 
@@ -234,7 +222,7 @@ __m256 intel_log_8(__m256 x) {
 }
 
 __m256 log10_8(__m256 x) {
-	return _mm256_mul_ps(x, _mm256_set1_ps(0.4342944819f)); //log(x) / In(10)
+	return 0.4342944819f * intel_log_8(x); //log(x) / In(10)
 }
 
 __m256 intel_exp_8(__m256 x) {
